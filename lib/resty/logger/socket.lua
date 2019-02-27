@@ -1,6 +1,18 @@
 -- Copyright (C) 2013-2014 Jiale Zhi (calio), CloudFlare Inc.
 --require "luacov"
 
+local ffi = require "ffi"
+local base = require "resty.core.base"
+
+local ffi_new = ffi.new
+local ffi_str = ffi.string
+local ffi_fill = ffi.fill
+local C = ffi.C
+local string_format = string.format
+local error = error
+local errmsg = base.get_errmsg_ptr()
+local FFI_OK = base.FFI_OK
+
 local concat                = table.concat
 local tcp                   = ngx.socket.tcp
 local timer_at              = ngx.timer.at
@@ -16,6 +28,10 @@ local NOTICE                = ngx.NOTICE
 local WARN                  = ngx.WARN
 local ERR                   = ngx.ERR
 local CRIT                  = ngx.CRIT
+
+ffi.cdef[[
+int ngx_http_lua_socket_tcp_ffi_set_buf(ngx_http_request_t *r, void *u, void *cdata_ctx, size_t len, char **err);
+]]
 
 
 local ok, new_tab = pcall(require, "table.new")
@@ -57,8 +73,10 @@ local need_periodic_flush   = nil
 
 -- internal variables
 local buffer_size           = 0
--- 2nd level buffer, it stores logs ready to be sent out
-local send_buffer           = ""
+-- 2nd level buffer as ffi char array, it stores logs ready to be sent out.
+local send_buffer
+-- Current length of 2nd level buffer
+local send_buffer_len       = 0
 -- 1st level buffer, it stores incoming logs
 local log_buffer_data       = new_tab(20000, 0)
 -- number of log lines in current 1st level buffer, starts from 0
@@ -76,7 +94,34 @@ local retry_interval        = 100         -- 0.1s
 local pool_size             = 10
 local flushing
 local logger_initted
+local logger_enable_ffi
 local counter               = 0
+
+local function check_tcp(tcp)
+    if not tcp or type(tcp) ~= "table" then
+        return error("bad \"tcp\" argument")
+    end
+
+    tcp = tcp[1]
+    if type(tcp) ~= "userdata" then
+        return error("bad \"tcp\" argument")
+    end
+
+    return tcp
+end
+
+local function ffi_set_buffer(tcp, buffer, len)
+    tcp = check_tcp(tcp)
+    local r = base.get_request()
+    if not r then
+        return error("no request found")
+    end
+    local rc = C.ngx_http_lua_socket_tcp_ffi_set_buf(r, tcp, buffer, len, errmsg)
+    if rc ~= FFI_OK then
+        return nil, ffi_str(errmsg[0])
+    end
+    return true
+end
 
 
 local function _write_error(msg)
@@ -155,8 +200,21 @@ local function _connect()
 end
 
 local function _prepare_stream_buffer()
-    local packet = concat(log_buffer_data, "", 1, log_buffer_index)
-    send_buffer = send_buffer .. packet
+    local idx = 0
+
+    for i = 1, log_buffer_index do
+        local log_line = log_buffer_data[i]
+        local msg, msg_len
+        if type(log_line) == "table" then
+            msg, msg_len = log_line[1], log_line[2]
+            ffi.copy(send_buffer + idx, msg, msg_len)
+        else
+            msg, msg_len = log_line, #log_line
+            ffi.copy(send_buffer + idx, ffi_str(msg), msg_len)
+        end
+        idx = idx + msg_len
+        send_buffer_len = send_buffer_len + msg_len
+    end
 
     log_buffer_index = 0
     counter = counter + 1
@@ -171,21 +229,32 @@ local function _prepare_stream_buffer()
 end
 
 local function _do_flush()
-    local packet = send_buffer
     local sock, err = _connect()
     if not sock then
         return nil, err
     end
 
-    local bytes, err = sock:send(packet)
-    if not bytes then
-        -- "sock:send" always closes current connection on error
-        return nil, err
+    local bytes
+    local err
+    if not logger_enable_ffi then
+        bytes, err = sock:send(ffi.string(send_buffer, send_buffer_len))
+        if not bytes then
+            -- "sock:send" always closes current connection on error
+            return nil, err
+        end
+    else
+        if not ffi_set_buffer(sock, send_buffer, send_buffer_len) then
+            return nil, "failed to set buffer using ffi"
+        end
+        bytes, err = sock:ffi_send()
+        if not bytes then
+            return nil, err
+        end
     end
 
     if debug then
         ngx.update_time()
-        ngx_log(DEBUG, ngx.now(), ":log flush:" .. bytes .. ":" .. packet)
+        ngx_log(DEBUG, ngx.now(), ":log flush:" .. bytes)
     end
 
     local ok, err = sock:setkeepalive(0, pool_size)
@@ -286,8 +355,9 @@ local function _flush()
         end
     end
 
-    buffer_size = buffer_size - #send_buffer
-    send_buffer = ""
+    buffer_size = buffer_size - send_buffer_len
+    ffi.fill(send_buffer, send_buffer_len)
+    send_buffer_len = 0
 
     return bytes
 end
@@ -319,6 +389,15 @@ local function _flush_buffer()
         _write_error(err)
         return nil, err
     end
+end
+
+local function _write_buffer_cdata(msg, msg_len)
+    log_buffer_index = log_buffer_index + 1
+    local buf = ffi_new("char[?]", msg_len)
+    ffi.copy(buf, msg, msg_len)
+    log_buffer_data[log_buffer_index] = {buf, msg_len}
+    buffer_size = buffer_size + msg_len
+    return buffer_size
 end
 
 local function _write_buffer(msg)
@@ -360,6 +439,8 @@ function _M.init(user_config)
             max_buffer_reuse = v
         elseif k == "periodic_flush" then
             periodic_flush = v
+        elseif k == "enable_ffi" then
+            logger_enable_ffi = v
         end
     end
 
@@ -380,6 +461,8 @@ function _M.init(user_config)
     connected = false
     retry_connect = 0
     retry_send = 0
+    send_buffer = ffi.new("char[?]", drop_limit)
+    ffi.fill(send_buffer, drop_limit)
 
     logger_initted = true
 
@@ -393,6 +476,58 @@ function _M.init(user_config)
     end
 
     return logger_initted
+end
+
+function _M.log_cdata(msg, msg_len)
+    if not logger_initted then
+        return nil, "not initialized"
+    end
+
+    if not logger_enable_ffi then
+      return _M.log(ffi_str(msg, msg_len))
+    end
+
+    local bytes
+
+    if (debug) then
+        ngx.update_time()
+        ngx_log(DEBUG, ngx.now(), ":log message length: " .. msg_len)
+    end
+
+    -- response of "_flush_buffer" is not checked, because it writes
+    -- error buffer
+    if (is_exiting()) then
+        exiting = true
+        _write_buffer_cdata(msg, msg_len)
+        _flush_buffer()
+        if (debug) then
+            ngx_log(DEBUG, "Nginx worker is exiting")
+        end
+        bytes = 0
+    elseif (msg_len + buffer_size < flush_limit) then
+        _write_buffer_cdata(msg, msg_len)
+        bytes = msg_len
+    elseif (msg_len + buffer_size <= drop_limit) then
+        _write_buffer_cdata(msg, msg_len)
+        _flush_buffer()
+        bytes = msg_len
+    else
+        _flush_buffer()
+        if (debug) then
+            ngx_log(DEBUG, "logger buffer is full, this log message will be "
+                    .. "dropped")
+        end
+        bytes = 0
+        --- this log message doesn't fit in buffer, drop it
+    end
+
+    if last_error then
+        local err = last_error
+        last_error = nil
+        return bytes, err
+    end
+
+    return bytes
 end
 
 function _M.log(msg)

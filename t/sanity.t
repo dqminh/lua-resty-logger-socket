@@ -5,7 +5,7 @@ use Cwd qw(cwd);
 
 repeat_each(2);
 
-plan tests => repeat_each() * (blocks() * 4 + 5);
+plan tests => repeat_each() * (blocks() * 4 + 7);
 our $HtmlDir = html_dir;
 
 my $pwd = cwd();
@@ -699,3 +699,92 @@ GET /t
 foo
 wrote bytes: 3
 wrote bytes: 3
+
+
+
+=== TEST 17: small flush_limit, instant flush, write cdata
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua 'ngx.say("foo")';
+        log_by_lua '
+            collectgarbage()  -- to help leak testing
+
+            local logger = require "resty.logger.socket"
+            local ffi = require "ffi"
+
+            if not logger.initted() then
+                local ok, err = logger.init{
+                    host = "127.0.0.1",
+                    port = 29999,
+                    flush_limit = 1,
+                    pool_size = 5,
+                    retry_interval = 1,
+                    timeout = 100,
+                    enable_ffi = true,
+                }
+            end
+
+            local data = ffi.new("char[5]")
+            ffi.copy(data, "hello", 5)
+
+            local bytes, err = logger.log_cdata(data, 5)
+            if err then
+                ngx.log(ngx.ERR, err)
+            end
+        ';
+    }
+--- request
+GET /t?a=1&b=2
+--- wait: 0.1
+--- tcp_listen: 29999
+--- tcp_reply:
+--- no_error_log
+[error]
+--- tcp_query: hello
+--- tcp_query_len: 5
+--- response_body
+foo
+
+
+
+=== TEST 18: small flush_limit, instant flush, unix domain socket, cdata but logging string
+--- http_config eval: $::HttpConfig
+--- config
+    location /t {
+        content_by_lua 'ngx.say("foo")';
+        log_by_lua '
+            collectgarbage()  -- to help leak testing
+
+            local logger = require "resty.logger.socket"
+            if not logger.initted() then
+                local ok, err = logger.init{
+                    flush_limit = 1,
+                    path = "$TEST_NGINX_HTML_DIR/logger_test.sock",
+                    retry_interval = 1,
+                    timeout = 100,
+                    enable_ffi = true,
+                }
+                if not ok then
+                    ngx.log(ngx.ERR, err)
+                    return
+                end
+            end
+
+            local bytes, err = logger.log(ngx.var.request_uri)
+            if err then
+                ngx.log(ngx.ERR, err)
+            end
+        ';
+    }
+--- request
+GET /t?a=1&b=2
+--- wait: 0.1
+--- tcp_listen eval: "$ENV{TEST_NGINX_HTML_DIR}/logger_test.sock"
+--- tcp_reply:
+--- no_error_log
+[error]
+--- tcp_query: /t?a=1&b=2
+--- tcp_query_len: 10
+--- response_body
+foo
